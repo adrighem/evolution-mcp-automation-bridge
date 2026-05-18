@@ -1,5 +1,6 @@
 #include <glib.h>
 #include <gio/gio.h>
+#include <json-glib/json-glib.h>
 
 typedef struct _EBookClientView EBookClientView;
 typedef struct _EBookClient EBookClient;
@@ -35,28 +36,28 @@ static const gchar xml[] =
     "      <arg type='b' name='success' direction='out'/>"
     "      <arg type='s' name='message' direction='out'/>"
     "    </method>"
-    "    <method name='MarkAsRead'>"
-    "      <arg type='s' name='account_uid' direction='in'/>"
-    "      <arg type='s' name='message_uid' direction='in'/>"
-    "      <arg type='s' name='folder_name' direction='in'/>"
-    "      <arg type='b' name='read' direction='in'/>"
-    "      <arg type='b' name='success' direction='out'/>"
-    "      <arg type='s' name='message' direction='out'/>"
-    "    </method>"
-    "    <method name='SendMail'>"
-    "      <arg type='s' name='account_uid' direction='in'/>"
-    "      <arg type='s' name='to' direction='in'/>"
-    "      <arg type='s' name='subject' direction='in'/>"
-    "      <arg type='s' name='body' direction='in'/>"
-    "      <arg type='b' name='success' direction='out'/>"
-    "      <arg type='s' name='message' direction='out'/>"
-    "    </method>"
     "    <method name='GetMessage'>\n"
     "      <arg type='s' name='account_uid' direction='in'/>\n"
     "      <arg type='s' name='message_uid' direction='in'/>\n"
     "      <arg type='s' name='folder_name' direction='in'/>\n"
     "      <arg type='b' name='success' direction='out'/>\n"
     "      <arg type='s' name='content' direction='out'/>\n"
+    "    </method>\n"
+    "    <method name='ListAttachments'>\n"
+    "      <arg type='s' name='account_uid' direction='in'/>\n"
+    "      <arg type='s' name='message_uid' direction='in'/>\n"
+    "      <arg type='s' name='folder_name' direction='in'/>\n"
+    "      <arg type='b' name='success' direction='out'/>\n"
+    "      <arg type='s' name='attachments_json' direction='out'/>\n"
+    "    </method>\n"
+    "    <method name='SaveAttachment'>\n"
+    "      <arg type='s' name='account_uid' direction='in'/>\n"
+    "      <arg type='s' name='message_uid' direction='in'/>\n"
+    "      <arg type='s' name='folder_name' direction='in'/>\n"
+    "      <arg type='s' name='attachment_name' direction='in'/>\n"
+    "      <arg type='s' name='dest_path' direction='in'/>\n"
+    "      <arg type='b' name='success' direction='out'/>\n"
+    "      <arg type='s' name='message' direction='out'/>\n"
     "    </method>\n"
     "  </interface>\n"
     "</node>";
@@ -154,8 +155,6 @@ handle_delete_message (GVariant *parameters, GDBusMethodInvocation *invocation)
     CamelFolder *folder_obj = NULL;
     GError *error = NULL;
 
-    gboolean success;
-
     g_print ("McpAutomationBridge: DeleteMessage called\n");
 
     if (!shell) {
@@ -191,181 +190,15 @@ handle_delete_message (GVariant *parameters, GDBusMethodInvocation *invocation)
         return;
     }
 
-    if (!camel_folder_set_message_flags (folder_obj, message_uid, CAMEL_MESSAGE_DELETED | CAMEL_MESSAGE_SEEN, CAMEL_MESSAGE_DELETED | CAMEL_MESSAGE_SEEN)) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Failed to set message flags (message might not exist)"));
-        g_object_unref (folder_obj);
-        g_object_unref (service);
-        return;
-    }
+    camel_folder_set_message_flags (folder_obj, message_uid, CAMEL_MESSAGE_DELETED | CAMEL_MESSAGE_SEEN, CAMEL_MESSAGE_DELETED | CAMEL_MESSAGE_SEEN);
+    camel_folder_synchronize_sync (folder_obj, FALSE, NULL, NULL);
 
-    success = camel_folder_synchronize_sync (folder_obj, FALSE, NULL, &error);
-
-    if (success) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, "Message deleted successfully"));
-    } else {
-        gchar *msg = g_strdup_printf ("Sync failed: %s", error ? error->message : "Unknown error");
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, msg));
-        g_free (msg);
-        g_clear_error (&error);
-    }
+    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, "Message deleted successfully"));
 
     g_object_unref (folder_obj);
     g_object_unref (service);
 }
 
-static void
-handle_mark_as_read (GVariant *parameters, GDBusMethodInvocation *invocation)
-{
-    EShell *shell = e_shell_get_default ();
-    EShellBackend *shell_backend;
-    EMailBackend *backend;
-    EMailSession *session;
-    const gchar *account_uid, *message_uid, *folder_name;
-    gboolean read;
-    CamelService *service;
-    CamelFolder *folder_obj = NULL;
-    GError *error = NULL;
-    gboolean success;
-
-    g_print ("McpAutomationBridge: MarkAsRead called\n");
-
-    if (!shell) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Shell not available"));
-        return;
-    }
-
-    shell_backend = e_shell_get_backend_by_name (shell, "mail");
-    if (!shell_backend) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Mail backend not found"));
-        return;
-    }
-
-    backend = E_MAIL_BACKEND (shell_backend);
-    session = e_mail_backend_get_session (backend);
-
-    g_variant_get (parameters, "(&s&s&sb)", &account_uid, &message_uid, &folder_name, &read);
-
-    service = camel_session_ref_service (CAMEL_SESSION (session), account_uid);
-    if (!service || !CAMEL_IS_STORE (service)) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Account not found or is not a store"));
-        if (service) g_object_unref (service);
-        return;
-    }
-
-    folder_obj = camel_store_get_folder_sync (CAMEL_STORE (service), folder_name, 0, NULL, &error);
-    if (!folder_obj) {
-        gchar *msg = g_strdup_printf ("Folder not found: %s", error ? error->message : "Unknown error");
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, msg));
-        g_free (msg);
-        g_clear_error (&error);
-        g_object_unref (service);
-        return;
-    }
-
-    guint32 set_mask = read ? CAMEL_MESSAGE_SEEN : 0;
-    if (!camel_folder_set_message_flags (folder_obj, message_uid, CAMEL_MESSAGE_SEEN, set_mask)) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Failed to set message flags (message might not exist)"));
-        g_object_unref (folder_obj);
-        g_object_unref (service);
-        return;
-    }
-
-    success = camel_folder_synchronize_sync (folder_obj, FALSE, NULL, &error);
-
-    if (success) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, "Message read status updated"));
-    } else {
-        gchar *msg = g_strdup_printf ("Sync failed: %s", error ? error->message : "Unknown error");
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, msg));
-        g_free (msg);
-        g_clear_error (&error);
-    }
-
-    g_object_unref (folder_obj);
-    g_object_unref (service);
-}
-
-static void
-handle_send_mail (GVariant *parameters, GDBusMethodInvocation *invocation)
-{
-    EShell *shell = e_shell_get_default ();
-    EShellBackend *shell_backend;
-    EMailBackend *backend;
-    EMailSession *session;
-    const gchar *account_uid, *to, *subject, *body;
-    CamelMimeMessage *message;
-    CamelInternetAddress *to_addr;
-    gboolean success;
-    GError *error = NULL;
-
-    g_print ("McpAutomationBridge: SendMail called\n");
-
-    if (!shell) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Shell not available"));
-        return;
-    }
-
-    shell_backend = e_shell_get_backend_by_name (shell, "mail");
-    if (!shell_backend) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Mail backend not found"));
-        return;
-    }
-
-    backend = E_MAIL_BACKEND (shell_backend);
-    session = e_mail_backend_get_session (backend);
-
-    g_variant_get (parameters, "(&s&s&s&s)", &account_uid, &to, &subject, &body);
-
-    message = camel_mime_message_new ();
-    camel_mime_message_set_subject (message, subject);
-
-    to_addr = camel_internet_address_new ();
-    if (camel_internet_address_add (to_addr, "", to) == -1) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Invalid To address"));
-        g_object_unref (to_addr);
-        g_object_unref (message);
-        return;
-    }
-    camel_mime_message_set_recipients (message, CAMEL_RECIPIENT_TYPE_TO, to_addr);
-    g_object_unref (to_addr);
-
-    ESourceRegistry *registry = e_shell_get_registry (shell);
-    ESource *source = e_source_registry_ref_source (registry, account_uid);
-    if (source) {
-        if (e_source_has_extension (source, E_SOURCE_EXTENSION_MAIL_IDENTITY)) {
-            ESourceMailIdentity *id_ext = e_source_get_extension (source, E_SOURCE_EXTENSION_MAIL_IDENTITY);
-            const gchar *addr = e_source_mail_identity_get_address (id_ext);
-            const gchar *name = e_source_mail_identity_get_name (id_ext);
-            if (addr) {
-                CamelInternetAddress *from_addr = camel_internet_address_new ();
-                camel_internet_address_add (from_addr, name ? name : "", addr);
-                camel_mime_message_set_from (message, from_addr);
-                g_object_unref (from_addr);
-            }
-        }
-        g_object_unref (source);
-    }
-
-    CamelMimePart *part = camel_mime_part_new ();
-    camel_mime_part_set_content (part, body, strlen (body), "text/plain");
-    camel_medium_set_content (CAMEL_MEDIUM (message), CAMEL_DATA_WRAPPER (part));
-    g_object_unref (part);
-
-    camel_medium_add_header (CAMEL_MEDIUM (message), "X-Evolution-Account", account_uid);
-
-    success = e_mail_session_append_to_local_folder_sync (session, E_MAIL_LOCAL_FOLDER_OUTBOX, message, NULL, NULL, NULL, &error);
-
-    if (success) {
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, "Mail appended to Outbox successfully"));
-    } else {
-        gchar *msg = g_strdup_printf ("Failed to append to Outbox: %s", error ? error->message : "Unknown error");
-        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, msg));
-        g_free (msg);
-        g_clear_error (&error);
-    }
-
-    g_object_unref (message);
-}
 
 static void
 handle_get_message (GVariant *parameters, GDBusMethodInvocation *invocation)
@@ -446,6 +279,204 @@ handle_get_message (GVariant *parameters, GDBusMethodInvocation *invocation)
     }
 
     g_object_unref (stream);
+    g_byte_array_free (byte_array, TRUE);
+    g_object_unref (message);
+    g_object_unref (folder_obj);
+    g_object_unref (service);
+}
+
+typedef struct {
+    JsonArray *array;
+} ListAttachmentsData;
+
+static void
+list_attachments_cb (CamelMimePart *part, gpointer user_data)
+{
+    ListAttachmentsData *data = user_data;
+    const gchar *filename;
+    
+    filename = camel_mime_part_get_filename (part);
+    if (filename) {
+        JsonObject *obj = json_object_new ();
+        CamelDataWrapper *dw = camel_medium_get_content (CAMEL_MEDIUM (part));
+        const gchar *mime_type = camel_data_wrapper_get_mime_type (dw);
+        
+        json_object_set_string_member (obj, "filename", filename);
+        json_object_set_string_member (obj, "mime_type", mime_type);
+        
+        json_array_add_object_element (data->array, obj);
+    }
+}
+
+static void
+handle_list_attachments (GVariant *parameters, GDBusMethodInvocation *invocation)
+{
+    EShell *shell = e_shell_get_default ();
+    EShellBackend *shell_backend;
+    EMailBackend *backend;
+    EMailSession *session;
+    const gchar *account_uid, *message_uid, *folder_name;
+    CamelService *service;
+    CamelFolder *folder_obj = NULL;
+    CamelMimeMessage *message = NULL;
+    GError *error = NULL;
+
+    g_print ("McpAutomationBridge: ListAttachments called\n");
+
+    if (!shell) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Shell not available"));
+        return;
+    }
+
+    shell_backend = e_shell_get_backend_by_name (shell, "mail");
+    backend = E_MAIL_BACKEND (shell_backend);
+    session = e_mail_backend_get_session (backend);
+
+    g_variant_get (parameters, "(&s&s&s)", &account_uid, &message_uid, &folder_name);
+
+    service = camel_session_ref_service (CAMEL_SESSION (session), account_uid);
+    if (!service || !CAMEL_IS_STORE (service)) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Account not found"));
+        if (service) g_object_unref (service);
+        return;
+    }
+
+    folder_obj = camel_store_get_folder_sync (CAMEL_STORE (service), folder_name, 0, NULL, &error);
+    if (!folder_obj) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Folder not found"));
+        g_clear_error (&error);
+        g_object_unref (service);
+        return;
+    }
+
+    message = camel_folder_get_message_sync (folder_obj, message_uid, NULL, &error);
+    if (!message) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Message not found"));
+        g_clear_error (&error);
+        g_object_unref (folder_obj);
+        g_object_unref (service);
+        return;
+    }
+
+    ListAttachmentsData data;
+    data.array = json_array_new ();
+    
+    camel_mime_message_foreach_part (message, (CamelForeachPartFunc) list_attachments_cb, &data);
+
+    JsonNode *root = json_node_new (JSON_NODE_ARRAY);
+    json_node_take_array (root, data.array);
+    
+    JsonGenerator *generator = json_generator_new ();
+    json_generator_set_root (generator, root);
+    gchar *json_str = json_generator_to_data (generator, NULL);
+    
+    g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, json_str));
+    
+    g_free (json_str);
+    g_object_unref (generator);
+    json_node_free (root);
+    g_object_unref (message);
+    g_object_unref (folder_obj);
+    g_object_unref (service);
+}
+
+typedef struct {
+    const gchar *target_name;
+    const gchar *dest_path;
+    gboolean found;
+    GError *error;
+} SaveAttachmentData;
+
+static void
+save_attachment_cb (CamelMimePart *part, gpointer user_data)
+{
+    SaveAttachmentData *data = user_data;
+    const gchar *filename;
+    
+    if (data->found) return;
+
+    filename = camel_mime_part_get_filename (part);
+    if (filename && g_strcmp0 (filename, data->target_name) == 0) {
+        CamelDataWrapper *dw = camel_medium_get_content (CAMEL_MEDIUM (part));
+        CamelStream *stream;
+        
+        stream = camel_stream_fs_new_with_name (data->dest_path, O_CREAT | O_WRONLY | O_TRUNC, 0666, &data->error);
+        if (stream) {
+            camel_data_wrapper_decode_to_stream_sync (dw, stream, NULL, &data->error);
+            g_object_unref (stream);
+            if (!data->error)
+                data->found = TRUE;
+        }
+    }
+}
+
+static void
+handle_save_attachment (GVariant *parameters, GDBusMethodInvocation *invocation)
+{
+    EShell *shell = e_shell_get_default ();
+    EShellBackend *shell_backend;
+    EMailBackend *backend;
+    EMailSession *session;
+    const gchar *account_uid, *message_uid, *folder_name, *attachment_name, *dest_path;
+    CamelService *service;
+    CamelFolder *folder_obj = NULL;
+    CamelMimeMessage *message = NULL;
+    GError *error = NULL;
+
+    g_print ("McpAutomationBridge: SaveAttachment called\n");
+
+    if (!shell) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Shell not available"));
+        return;
+    }
+
+    shell_backend = e_shell_get_backend_by_name (shell, "mail");
+    backend = E_MAIL_BACKEND (shell_backend);
+    session = e_mail_backend_get_session (backend);
+
+    g_variant_get (parameters, "(&s&s&s&s&s)", &account_uid, &message_uid, &folder_name, &attachment_name, &dest_path);
+
+    service = camel_session_ref_service (CAMEL_SESSION (session), account_uid);
+    if (!service || !CAMEL_IS_STORE (service)) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Account not found"));
+        if (service) g_object_unref (service);
+        return;
+    }
+
+    folder_obj = camel_store_get_folder_sync (CAMEL_STORE (service), folder_name, 0, NULL, &error);
+    if (!folder_obj) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Folder not found"));
+        g_clear_error (&error);
+        g_object_unref (service);
+        return;
+    }
+
+    message = camel_folder_get_message_sync (folder_obj, message_uid, NULL, &error);
+    if (!message) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, "Message not found"));
+        g_clear_error (&error);
+        g_object_unref (folder_obj);
+        g_object_unref (service);
+        return;
+    }
+
+    SaveAttachmentData data;
+    data.target_name = attachment_name;
+    data.dest_path = dest_path;
+    data.found = FALSE;
+    data.error = NULL;
+    
+    camel_mime_message_foreach_part (message, (CamelForeachPartFunc) save_attachment_cb, &data);
+
+    if (data.found) {
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", TRUE, "Attachment saved successfully"));
+    } else {
+        gchar *msg = g_strdup_printf ("Attachment '%s' not found or save failed: %s", attachment_name, data.error ? data.error->message : "Unknown error");
+        g_dbus_method_invocation_return_value (invocation, g_variant_new ("(bs)", FALSE, msg));
+        g_free (msg);
+        g_clear_error (&data.error);
+    }
+
     g_object_unref (message);
     g_object_unref (folder_obj);
     g_object_unref (service);
@@ -465,12 +496,12 @@ handle_method_call (GDBusConnection *connection,
         handle_move_message (parameters, invocation);
     } else if (g_strcmp0 (method_name, "DeleteMessage") == 0) {
         handle_delete_message (parameters, invocation);
-    } else if (g_strcmp0 (method_name, "MarkAsRead") == 0) {
-        handle_mark_as_read (parameters, invocation);
-    } else if (g_strcmp0 (method_name, "SendMail") == 0) {
-        handle_send_mail (parameters, invocation);
     } else if (g_strcmp0 (method_name, "GetMessage") == 0) {
         handle_get_message (parameters, invocation);
+    } else if (g_strcmp0 (method_name, "ListAttachments") == 0) {
+        handle_list_attachments (parameters, invocation);
+    } else if (g_strcmp0 (method_name, "SaveAttachment") == 0) {
+        handle_save_attachment (parameters, invocation);
     }
 }
 
