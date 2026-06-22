@@ -1,5 +1,7 @@
 # Evolution MCP Automation Bridge
 
+Note: now merged into the eds-mcp repo.
+
 This is an Evolution EPlugin that exposes a D-Bus interface for programmatic control of the Evolution Mail client. It is primarily designed to act as a bridge for the **EDS Model Context Protocol (MCP)** server, allowing AI agents to perform actions like moving or deleting messages directly through the Evolution UI state.
 
 ## Features
